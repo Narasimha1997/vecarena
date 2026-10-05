@@ -4,8 +4,11 @@ package vecarena
 
 import (
 	"math/rand"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -91,6 +94,83 @@ func TestConcurrentReadersOneWriter(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// TestNoTornReadsOnSlotReuse is the B-01 regression test: readers check that
+// every row they see is internally consistent (v[j] == v[0]+j) while a writer
+// keeps deleting rows and re-adding them, which reuses freed slots.
+func TestNoTornReadsOnSlotReuse(t *testing.T) {
+	run := 10 * time.Second
+	if testing.Short() {
+		run = time.Second
+	}
+	const dim, live = 256, 512
+	a, err := New(dim, 4*live, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	v := make([]float32, dim)
+	fill := func(gen int) {
+		base := float32(gen % (1 << 20)) // keeps v[0]+j exact in float32
+		for j := range v {
+			v[j] = base + float32(j)
+		}
+	}
+	ids := make([]uint32, live)
+	for i := range ids {
+		fill(i)
+		ids[i], _ = a.Add(v)
+	}
+
+	var stop atomic.Bool
+	var torn, scans atomic.Int64
+	var wg sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for !stop.Load() {
+				a.Range(0, 4*live, func(_ uint32, row []float32) {
+					for j := range row {
+						if row[j] != row[0]+float32(j) {
+							torn.Add(1)
+							return
+						}
+					}
+				})
+				scans.Add(1)
+			}
+		}()
+	}
+
+	rng := rand.New(rand.NewSource(1))
+	adds := 0
+	for deadline := time.Now().Add(run); time.Now().Before(deadline); {
+		i := rng.Intn(live)
+		a.Delete(ids[i])
+		fill(live + adds)
+		for {
+			id, err := a.Add(v)
+			if err == nil {
+				ids[i] = id
+				break
+			}
+			runtime.Gosched() // full: wait for readers to release pending ids
+		}
+		adds++
+	}
+	stop.Store(true)
+	wg.Wait()
+
+	if n := torn.Load(); n > 0 {
+		t.Fatalf("%d torn rows seen in %d scans", n, scans.Load())
+	}
+	if hw := a.count.Load(); int(hw) >= live+adds {
+		t.Fatalf("no slot was reused (high-water %d after %d adds)", hw, live+adds)
+	}
+	t.Logf("%d adds, %d scans, high-water %d rows", adds, scans.Load(), a.count.Load())
 }
 
 func dot(a, b []float32) float32 {

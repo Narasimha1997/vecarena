@@ -20,6 +20,13 @@ type Index struct {
 
 	TileRows int
 	Workers  int
+
+	// Live, if set, reports whether a row may appear in results; rows for
+	// which it returns false are skipped. It is called only for scores that
+	// would enter a top-k heap. Pass (*vecarena.Arena).IsLive to hide
+	// deleted rows, and hold an arena Guard around SearchBatch so rows are
+	// not reused mid-scan.
+	Live func(id uint32) bool
 }
 
 func New(rows []float32, stride, n int) *Index {
@@ -51,6 +58,7 @@ func (ix *Index) SearchBatch(queries [][]float32, k int) [][]Result {
 		workers = tiles
 	}
 
+	isLive := ix.Live
 	partial := make([][]topK, workers)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -78,8 +86,13 @@ func (ix *Index) SearchBatch(queries [][]float32, k int) [][]Result {
 					live := min(kernel.QueryGroup, nq-base)
 					for r := 0; r < hi-lo; r++ {
 						row := out[r*kernel.QueryGroup : r*kernel.QueryGroup+live]
+						id := uint32(lo + r)
 						for q, s := range row {
-							heaps[base+q].push(uint32(lo+r), s)
+							h := &heaps[base+q]
+							if !h.accepts(s) || (isLive != nil && !isLive(id)) {
+								continue
+							}
+							h.push(id, s)
 						}
 					}
 				}
@@ -108,6 +121,11 @@ type topK struct {
 }
 
 func newTopK(k int) topK { return topK{k: k, items: make([]Result, 0, k)} }
+
+// accepts reports whether push(_, s) would change the heap.
+func (h *topK) accepts(s float32) bool {
+	return len(h.items) < h.k || s > h.items[0].Score
+}
 
 func (h *topK) push(id uint32, s float32) {
 	if len(h.items) < h.k {

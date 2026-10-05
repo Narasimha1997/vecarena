@@ -52,10 +52,13 @@ vecarena/
 │   ├── kernel_amd64.s      # AVX2+FMA assembly
 │   ├── kernel_other.go     # !amd64 stubs
 │   └── kernel_test.go
+├── cmd/vecbench/           # end-to-end benchmark CLI (linux only)
+│   └── main.go
 ├── search/                 # batched top-k search + request batcher
 │   ├── search.go
 │   ├── batcher.go
-│   └── search_test.go
+│   ├── search_test.go
+│   └── live_linux_test.go  # search over a real arena with deleted rows
 └── spsc/                   # single-producer single-consumer ring buffers
     ├── spsc.go
     ├── spsc_test.go
@@ -89,7 +92,9 @@ type Arena struct { /* unexported */ }
 
 Internal state: `count` (atomic int64, high-water mark of allocated ids), `live` (atomic int64),
 `wmu` (mutex serialising writers), `dead` (tombstone bitset, one bit per row, accessed atomically),
-`free` (LIFO stack of reusable ids, guarded by `wmu`).
+`free` (LIFO stack of reusable ids, guarded by `wmu`), `pending` (FIFO of deleted ids tagged with
+their delete epoch, guarded by `wmu`), `epoch` (atomic uint64, written only under `wmu`) and
+`readers[2]` (cache-line-padded atomic reader counts, indexed by `epoch & 1`).
 
 ### 4.3 API [DONE]
 
@@ -97,19 +102,31 @@ Internal state: `count` (atomic int64, high-water mark of allocated ids), `live`
 |---|---|
 | `New(dim, maxRows int, opt Options) (*Arena, error)` | Errors: `dim <= 0` or `maxRows <= 0`; mmap failure; mlock failure (the region is unmapped before returning). |
 | `(*Arena) Add(v []float32) (uint32, error)` | `len(v) != dim` returns error `"vecarena: wrong dimension"`. Reuses the most recently freed id (LIFO) if one exists: copies `v`, then atomically clears its dead bit. Otherwise takes id `count`, copies `v`, then atomically stores `count+1` (publishing the row). If `count == maxRows` with no free ids, returns error `"vecarena: full"`. Increments `live`. |
-| `(*Arena) Delete(id uint32)` | No-op if `id >= count` or the row is already dead. Otherwise sets the dead bit atomically, pushes `id` onto `free`, decrements `live`. Idempotent. |
-| `(*Arena) Get(id uint32) []float32` | View of length `dim` (capacity `stride`). No liveness check: a dead id returns stale data. Out-of-range ids panic (slice bounds). |
+| `(*Arena) Delete(id uint32)` | No-op if `id >= count` or the row is already dead. Otherwise sets the dead bit atomically, appends `(id, epoch)` to `pending`, decrements `live`, then runs reclamation (4.4). Idempotent. The id becomes reusable only once reclaimed. |
+| `(*Arena) Enter() Guard`, `(Guard) Exit()` | Mark a read section. While a `Guard` is held, no row that was live when it was taken is reused. Every `Enter` must be paired with `Exit`. |
+| `(*Arena) IsLive(id uint32) bool` | `id < count` and the dead bit is clear. Lock-free; usable as `search.Index.Live`. |
+| `(*Arena) Get(id uint32) []float32` | View of length `dim` (capacity `stride`). No liveness check: a dead id returns stale data. Out-of-range ids panic (slice bounds). Hold a `Guard` while using the view if writers run concurrently. |
 | `(*Arena) Dim() int`, `Stride() int`, `Len() int` | `Len` is the live row count. |
-| `(*Arena) Block(lo, hi int) []float32` | Contiguous view of rows `[lo, hi)`, including dead rows. Rows `>= count` are zero. This is the input format for `kernel` and `search`. |
-| `(*Arena) Range(lo, hi int, fn func(id uint32, v []float32))` | Calls `fn` for each live row in `[lo, min(hi, count))`, in ascending id order. Skips 64 dead rows at a time using whole bitset words. |
+| `(*Arena) Block(lo, hi int) []float32` | Contiguous view of rows `[lo, hi)`, including dead rows. Rows `>= count` are zero. This is the input format for `kernel` and `search`. Hold a `Guard` while scanning it if writers run concurrently. |
+| `(*Arena) Range(lo, hi int, fn func(id uint32, v []float32))` | Calls `fn` for each live row in `[lo, min(hi, count))`, in ascending id order. Skips 64 dead rows at a time using whole bitset words. Holds a `Guard` for the whole scan. |
 | `(*Arena) Close() error` | Unmaps the region. Must not run concurrently with any other call. Every view obtained earlier becomes invalid. |
 
 ### 4.4 Concurrency contract
 - Writers (`Add`, `Delete`) are serialised by `wmu`, so any number of goroutines may call them.
 - Readers (`Get`, `Block`, `Range`) take no lock and may run concurrently with writers.
 - A reader sees a row only after it has been fully written, because `count` is published after the copy.
-- **[BUG] B-01, torn read on slot reuse.** A reader that checked the dead bit before a `Delete`
-  may still be reading that row while a later `Add` overwrites it. Fix in backlog `T-01`.
+- **Epoch-based reclamation [DONE] (fixed B-01, torn read on slot reuse).** A reader that checked
+  the dead bit before a `Delete` may still be reading that row, so a deleted id is not reused until
+  every reader that could see it has exited:
+  - `Enter`: load `e = epoch`, increment `readers[e&1]`, re-load `epoch`; if it changed, decrement
+    and retry. Only epochs `E` and `E-1` can have readers.
+  - Reclamation (under `wmu`, from `Delete`, and from `Add` when `free` is empty): move every
+    pending id with `deleteEpoch + 2 <= epoch` to `free`, in delete order; otherwise, if
+    `readers[(epoch+1)&1]` (the readers of `epoch-1`) is zero, increment `epoch` and repeat. It never
+    blocks; with no readers, a deleted id is reusable immediately.
+  - Readers that enter after a delete see the dead bit, so they never read the old row. Readers of
+    the delete epoch or earlier are gone once `epoch` has advanced twice.
+  - A long-held `Guard` delays reuse; `Add` returns `"vecarena: full"` if no id can be reclaimed.
 
 ### 4.5 Tests [DONE]
 - `TestAddGetDeleteReuse`: stride for dim 3 is 16; rows are 64-byte aligned; `Range` skips dead
@@ -117,6 +134,9 @@ Internal state: `count` (atomic int64, high-water mark of allocated ids), `live`
 - `TestRangeSkipsWholeWords`: 300 rows, delete 0–199; `Range` yields exactly 200–299 with correct data.
 - `TestConcurrentReadersOneWriter`: 4 readers running `Range` while one writer adds 50k rows and
   deletes some; no row may be torn. Must pass `-race`.
+- `TestNoTornReadsOnSlotReuse`: 4 readers check `v[j] == v[0]+j` on every row while a writer
+  deletes random rows and re-adds new ones for 10 s (1 s with `-short`); zero torn rows, and slots
+  must actually be reused. Fails within 1 s if reclamation ignores epochs.
 - `BenchmarkScan100k768`: scalar scan via `Range` (baseline only).
 
 ## 5. Package `kernel` (distance kernels)
@@ -176,6 +196,7 @@ type Result struct { ID uint32; Score float32 } // Score = dot product, higher i
 type Index struct {
     TileRows int // rows per cache tile; default max(16, 1 MiB / (stride*4))
     Workers  int // goroutines; default runtime.GOMAXPROCS(0)
+    Live     func(id uint32) bool // optional; rows where it returns false never appear in results
 }
 func New(rows []float32, stride, n int) *Index
 func (ix *Index) SearchBatch(queries [][]float32, k int) [][]Result
@@ -193,13 +214,17 @@ Preconditions: `stride % 8 == 0`; `len(rows) >= n*stride`; rows are zero-padded;
 4. For each tile, **every** query group runs `kernel.DotBatch8` over it before the worker moves
    to the next tile, so the tile is read from RAM once and then re-read from L2.
 5. Each worker keeps one top-k min-heap per query. When the heap is full, a score `<=` the root is
-   rejected with a single comparison.
+   rejected with a single comparison. Only a score that would enter the heap is checked against
+   `Live` (if set), so the filter costs nothing for most rows.
 6. Merge the per-worker heaps into a final top-k per query, sorted by descending score.
    Order among equal scores is unspecified.
 
-Output: per query, `min(k, n)` results. Tombstoned arena rows are **not** filtered ([TODO] `T-02`).
+Output: per query, `min(k, live rows)` results.
 
-### 6.2 Batcher [DONE, with bugs]
+**Tombstones [DONE]:** to search an arena with deletes, set `Live = arena.IsLive` and hold an
+arena `Guard` around `SearchBatch` so no row is reused mid-scan.
+
+### 6.2 Batcher [DONE]
 
 ```go
 func NewBatcher(ix *Index, maxBatch int, maxWait time.Duration) *Batcher
@@ -214,16 +239,25 @@ var ErrClosed = errors.New("search: batcher closed")
 - The batch runs with `k = max(k_i)`, and each result is trimmed to its own `k_i`.
 - `Search` returns `ctx.Err()` if the context ends while enqueueing or waiting. A request that was
   already enqueued still runs, and its reply is discarded (the reply channel is buffered to 1).
-- **[BUG] B-02:** `Close` closes `done`, but a `Search` whose `select` finds both the request
-  channel and `done` ready may enqueue after the loop has exited, and then wait forever unless its
-  context ends. Fix in `T-03`.
-- **[BUG] B-03:** calling `Close` twice panics (a channel closed twice). Fix in `T-03`.
+- Every enqueued request gets exactly one reply: results, or `ErrClosed`.
+- **Shutdown [DONE] (fixed B-02 and B-03):**
+  - `Close` is idempotent (`sync.Once`). It closes `done`, then takes `mu` for writing and closes
+    the request channel. `Search` holds `mu` for reading while it sends, and fails with
+    `ErrClosed` if `done` is closed, so no send can reach a closed channel.
+  - After `done` is closed, the dispatcher stops filling batches. Requests not yet dispatched,
+    and every request it drains afterwards, get `ErrClosed`. It exits when the request channel is
+    closed. A batch already running when `Close` is called completes normally.
 
 ### 6.3 Tests [DONE]
 - `TestSearchBatchMatchesBruteForce`: n = 5000, dim 100, stride 112, TileRows = 333 (uneven
   tiles), k = 10, query counts 1, 7, 8, 9, 20. Result ids must match an exact float64 top-k in order.
 - `TestBatcherGroupsConcurrentRequests`: 40 concurrent `Search` calls, maxBatch 16, maxWait 5 ms;
   every result matches brute force. Must pass `-race`.
+- `TestBatcherCloseRace`: 1000 concurrent `Search` calls race `Close`; every call returns (a
+  result or `ErrClosed`) within 1 s; a second `Close` doesn't panic; `Search` after `Close`
+  returns `ErrClosed`.
+- `TestDeletedRowsNeverReturned` (linux): delete the 100 best matches for a query from an arena;
+  with `Live = arena.IsLive`, none is returned and results equal brute force over the live rows.
 - `BenchmarkThroughput`: 100k × 768, k = 10, batch sizes 1, 8, 32, 64; reports `queries/s` and `ms/batch`.
 
 ## 7. Package `spsc`
@@ -302,9 +336,9 @@ whole test suite (section 10).
 
 | ID | Priority | Task | Acceptance criteria |
 |---|---|---|---|
-| T-01 | P0 | Fix B-01 (torn read on slot reuse). Hold freed ids in a *pending* list and move them to `free` only after every reader active at delete time has finished. Use epoch-based reclamation: readers enter and exit an epoch around `Range`/`Block` scans. | New test: readers verify a per-row checksum while a writer deletes and re-adds rows in a loop. Zero mismatches in 10 s under `-race`. |
-| T-02 | P0 | Tombstones in search. `search.New` accepts an optional `Live func(id uint32) bool`, or a bitset view exported by `Arena`. Dead rows never appear in results. | Test: delete the 100 best matches for a query; none of them are returned. |
-| T-03 | P0 | Fix B-02/B-03 in `Batcher`: `Close` is idempotent (`sync.Once`); after `Close`, pending and in-flight enqueues get `ErrClosed`. The dispatcher drains the channel on shutdown and replies `ErrClosed` to each request. | Test: 1000 concurrent `Search` calls racing `Close`; every call returns (a result or `ErrClosed`) within 1 s; calling `Close` twice doesn't panic. |
+| T-01 | P0 [DONE] | Fix B-01 (torn read on slot reuse). Hold freed ids in a *pending* list and move them to `free` only after every reader active at delete time has finished. Use epoch-based reclamation: readers enter and exit an epoch around `Range`/`Block` scans. | New test: readers verify a per-row checksum while a writer deletes and re-adds rows in a loop. Zero mismatches in 10 s under `-race`. |
+| T-02 | P0 [DONE] | Tombstones in search. `search.New` accepts an optional `Live func(id uint32) bool`, or a bitset view exported by `Arena`. Dead rows never appear in results. | Test: delete the 100 best matches for a query; none of them are returned. |
+| T-03 | P0 [DONE] | Fix B-02/B-03 in `Batcher`: `Close` is idempotent (`sync.Once`); after `Close`, pending and in-flight enqueues get `ErrClosed`. The dispatcher drains the channel on shutdown and replies `ErrClosed` to each request. | Test: 1000 concurrent `Search` calls racing `Close`; every call returns (a result or `ErrClosed`) within 1 s; calling `Close` twice doesn't panic. |
 | T-04 | P1 | Non-Linux build: `arena_other.go` using `syscall.Mmap` without `MAP_NORESERVE` on darwin; the huge-page option is a no-op there. | `GOOS=darwin go vet ./...` passes. |
 | T-05 | P1 | External ids: map `string` or `uint64` ids to internal `uint32` ids and back; handle upsert and delete. | Round-trip test; memory use per id documented. |
 | T-06 | P1 | `kernel.Normalize(v []float32)` (in place, L2), and an `Options.Normalize` flag on insert for cosine similarity. | Cosine top-k matches a float64 reference. |
