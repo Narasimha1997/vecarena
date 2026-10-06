@@ -17,6 +17,10 @@ vectors and makes the brute force scan as fast as the hardware allows. On a lapt
   never see a half written row.
 * **Request batcher.** Groups single queries from many goroutines into batches automatically.
 * **Instant updates.** Inserts and deletes take effect immediately, and deleted slots are reused.
+* **Your own ids.** Store vectors under string or integer keys, with upsert and delete.
+* **Metadata filters.** Filter by tags and number ranges using compressed bitmaps. Very selective
+  filters only score the matching rows, so they get faster, not slower.
+* **Cosine similarity.** Optional normalisation on insert turns dot product into cosine.
 * **Zero dependencies.** Pure Go plus a little assembly, standard library only.
 
 ## Why brute force?
@@ -35,8 +39,8 @@ vecarena focuses on making that scan bandwidth bound rather than compute bound.
 
 **Off heap storage.** Vectors live in a single anonymous `mmap` region outside the Go heap, so the
 garbage collector never scans them. Each row is padded to a multiple of 64 bytes, so every row
-starts on its own cache line. Memory is committed lazily as rows are written, and huge pages can
-be requested with `madvise`.
+starts on its own cache line. Memory is committed lazily as rows are written, and on Linux huge
+pages can be requested with `madvise`.
 
 **SIMD kernels.** Dot product and squared L2 distance use hand written AVX2 and FMA assembly,
 detected at startup through CPUID. Other CPUs fall back to portable Go automatically.
@@ -56,10 +60,17 @@ has finished, using epoch based reclamation, so a scan never reads a half writte
 **Request batching.** `search.Batcher` collects single queries from many goroutines into one
 batch, so a server handling one query per request still gets the batched throughput.
 
+**Filter planning.** Metadata lives in a column store, and every filter turns into a Roaring
+style compressed bitmap of matching rows. If a filter matches fewer than 5% of rows, the search
+scores only those rows. Otherwise it runs the normal batched scan and checks the filter only for
+rows good enough to enter the top k, which costs almost nothing.
+
 ## Requirements
 
 * Go 1.24 or newer
-* Linux. The arena uses `mmap` directly; macOS and other platforms are on the roadmap.
+* Linux or macOS for off heap `mmap` storage. On Windows and other systems vectors are kept in a
+  plain Go byte slice instead. The garbage collector still never scans it, but the memory is
+  committed up front rather than as rows are written.
 * For the fast path, an x86 CPU with AVX2 and FMA (Intel Haswell or newer, AMD Zen or newer).
   Everything also builds and runs on arm64 using the portable Go code, just more slowly.
 
@@ -110,8 +121,43 @@ arena.Delete(id)                // the slot is reused by a later Add
 `Add` reuses it. `Get` returns a slice that points directly into the arena, so treat it as read
 only.
 
-If you need cosine similarity, normalise your vectors to unit length before adding them. A helper
-for this is planned.
+### Using your own keys
+
+Most applications have their own ids, like document names or database keys. A `Collection` maps
+those to arena rows for you:
+
+```go
+docs, err := vecarena.NewCollection[string](768, 1_000_000, vecarena.Options{})
+if err != nil {
+	log.Fatal(err)
+}
+defer docs.Close()
+
+id, err := docs.Upsert("doc-42", embedding) // insert, or replace if the key exists
+docs.Delete("doc-42")
+
+key, ok := docs.Key(id) // turn a search result back into your key
+```
+
+The key can be any comparable type, such as `string` or `uint64`. Replacing a key writes the new
+vector to a fresh row and then deletes the old one, so a concurrent search never sees a half
+updated vector. Because of that, the row id for a key can change on every upsert. The mapping
+costs about 46 bytes per `uint64` key and 90 bytes per 16 byte string key, on top of the vectors.
+
+Search the collection through `docs.Arena()`, exactly as shown below.
+
+### Cosine similarity
+
+Set `Normalize` when you create the arena or collection, and normalise each query:
+
+```go
+docs, err := vecarena.NewCollection[string](768, 1_000_000, vecarena.Options{Normalize: true})
+// ...
+kernel.Normalize(query)
+```
+
+Every stored vector is scaled to unit length on insert (your slice is not modified), so the dot
+product scores that search returns are cosine similarities.
 
 ### Searching
 
@@ -147,6 +193,35 @@ A few things to keep in mind:
   a small struct), so build a new one after adding rows.
 * `Workers` and `TileRows` on the index can be changed if the defaults (all cores, about 1 MiB
   tiles) do not suit your machine.
+
+### Filtering by metadata
+
+Store metadata per row in a `filter.Columns`, then pass one filter per query to
+`SearchFiltered`:
+
+```go
+import "vecarena/filter"
+
+meta := filter.NewColumns()
+meta.SetString(id, "lang", "en")
+meta.SetNumber(id, "year", 2024)
+
+recent := meta.Select(filter.And(
+	filter.Eq("lang", "en"),
+	filter.AtLeast("year", 2020),
+))
+
+guard := arena.Enter()
+results := ix.SearchFiltered(queries, 10, []search.Filter{recent})
+guard.Exit()
+```
+
+Available expressions are `Eq`, `In`, `Range`, `AtLeast`, `AtMost`, `Has`, `And`, `Or` and `Not`.
+`Select` returns a bitmap, so you can build a filter once and reuse it across many searches. Use
+`nil` in the filter list for a query that should not be filtered.
+
+Metadata is stored by row id, so when you delete a row, or upsert a key in a collection (which
+moves it to a new row), call `meta.Clear` on the old row id and set the values on the new one.
 
 ### Serving single queries
 
@@ -203,6 +278,20 @@ With the `Batcher` in front and 64 goroutines each sending one query at a time, 
 
 Recall@10 against a separate brute force check was 1.0, as expected for an exact search.
 
+### Filtered search
+
+Same data, batches of 8 queries, each with its own random filter:
+
+| Rows matching the filter | Queries per second |
+|---:|---:|
+| 1% | 9,425 |
+| 10% | 624 |
+| 50% | 625 |
+| No filter | 643 |
+
+At 1% the planner scores only the matching rows, which is about 15 times faster than a full
+scan. From 5% upwards the normal scan runs, and the filter adds no measurable cost.
+
 ### Kernels
 
 | Operation | AVX2 | Plain Go | Speedup |
@@ -256,15 +345,21 @@ The per package micro benchmarks use the standard Go tooling:
 
 ```sh
 go test -run x -bench . -count 5 ./kernel ./search ./spsc
+
+# just the filtered search benchmark
+go test -run x -bench Filtered -count 5 ./search
 ```
 
 ## Project layout
 
 ```
 vecarena/
-├── arena_linux.go     off heap vector storage
+├── arena.go           off heap vector storage
+├── mem_*.go           memory mapping for Linux, macOS and everything else
+├── collection.go      your own keys mapped to arena rows
 ├── kernel/            dot product and L2 kernels, AVX2 assembly and Go fallbacks
-├── search/            batched top-k search and the request batcher
+├── search/            batched and filtered top-k search, and the request batcher
+├── filter/            compressed bitmaps, metadata columns and filter expressions
 ├── spsc/              single producer, single consumer ring buffers
 ├── cmd/vecbench/      end to end benchmark tool
 └── SPEC.md            detailed design, invariants and roadmap
@@ -278,10 +373,6 @@ does, start there.
 
 Planned work, roughly in order:
 
-* Builds for macOS and other non Linux platforms
-* External ids (strings or `uint64`) mapped to internal ids, with upsert
-* A normalise helper and option for cosine similarity
-* Metadata filters
 * int8 quantised scans with float32 rescoring
 * AVX-512 kernels that score 16 queries per pass
 * Snapshots to disk and recovery on restart
@@ -292,8 +383,8 @@ The backlog in [SPEC.md](SPEC.md) has the details and acceptance criteria for ea
 
 ## Current limitations
 
-* Linux only for now.
-* Vectors are float32 and the similarity is the dot product.
+* Vectors are float32 and the similarity is the dot product (or cosine, with normalisation).
+* Metadata is not tied to collections yet, so you keep it in step yourself when rows move.
 * Capacity is fixed when the arena is created.
 * Everything is in memory. Nothing is persisted yet.
 * There is one writer at a time. Concurrent writers are serialised by a mutex.
@@ -307,11 +398,13 @@ the repository root:
 gofmt -l .                     # should print nothing
 go vet ./...
 GOARCH=arm64 go vet ./...      # the portable fallbacks must still compile
+GOOS=darwin go vet ./...       # the macOS build
+GOOS=windows go vet ./...      # the fallback memory build
 go test -race -count=1 ./...
 ```
 
-The full test suite takes a little over 10 seconds because one test stress tests concurrent
-deletes for 10 seconds. Use `go test -short ./...` for a quicker loop while you work.
+The full test suite takes about 20 seconds, mostly because one test stress tests concurrent
+deletes for 10 seconds and another measures memory for a million keys. Use `go test -short ./...` for a quicker loop while you work.
 
 If your change affects performance, please run the relevant benchmarks before and after (at least
 5 runs each) and include both sets of numbers in the pull request.

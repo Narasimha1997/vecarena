@@ -1,5 +1,7 @@
 package kernel
 
+import "math"
+
 func Dot(a, b []float32) float32 {
 	if len(a) != len(b) {
 		panic("kernel: length mismatch")
@@ -37,6 +39,19 @@ func DotBatch(q, rows []float32, stride int, out []float32) {
 	}
 	for i := 0; i < n; i++ {
 		out[i] = dotGeneric(q, rows[i*stride:(i+1)*stride])
+	}
+}
+
+// Normalize scales v in place to unit L2 norm, so that Dot of two normalized
+// vectors is their cosine similarity. A zero vector is left unchanged.
+func Normalize(v []float32) {
+	sq := Dot(v, v)
+	if sq == 0 {
+		return
+	}
+	inv := float32(1 / math.Sqrt(float64(sq)))
+	for i := range v {
+		v[i] *= inv
 	}
 }
 

@@ -18,7 +18,7 @@ Status markers used below:
 **Goals**
 - Exact (brute-force) top-k search over float32 vectors held entirely in RAM.
 - Similarity is the **dot product**; cosine similarity is supported by L2-normalising vectors
-  before insert (a helper is on the backlog, `T-06`).
+  on insert (`Options.Normalize`) and normalising queries with `kernel.Normalize`.
 - The limiting factor should be memory bandwidth: SIMD kernels, batching, cache tiling, all cores.
 - Predictable memory: vectors live off the Go heap, so the garbage collector (GC) never scans them.
 - Safe concurrency: one writer at a time, many readers, correct under `go test -race`.
@@ -33,7 +33,7 @@ Status markers used below:
 |---|---|
 | Go | 1.24 or newer (uses generics, `min`/`max`/`clear` builtins, `atomic.Uint64`) |
 | Primary target | linux/amd64 with AVX2 and FMA (Intel Haswell+, AMD Zen+) |
-| Must compile | linux/arm64, using the portable Go fallbacks |
+| Must compile | linux/arm64 (portable Go kernels); darwin, windows and other OSes (section 4.1) |
 | Module path | `vecarena` |
 | Dependencies | standard library only. `golang.org/x/sys` is allowed if network access permits; the reference code avoids it. |
 
@@ -44,21 +44,31 @@ vecarena/
 ├── go.mod
 ├── SPEC.md                 # this file
 ├── CLAUDE.md               # working rules for Claude Code
-├── arena_linux.go          # package vecarena: off-heap vector arena (linux only)
+├── arena.go                # package vecarena: off-heap vector arena
 ├── arena_test.go
+├── mem_linux.go            # mmap with MAP_NORESERVE, madvise, mlock
+├── mem_darwin.go           # mmap without MAP_NORESERVE; HugePages ignored
+├── mem_other.go            # aligned Go heap []byte fallback for every other OS
+├── collection.go           # Collection[K]: external keys <-> row ids
+├── collection_test.go
 ├── kernel/                 # distance kernels
 │   ├── kernel.go           # public API + portable fallbacks
 │   ├── kernel_amd64.go     # asm declarations + CPU feature detection
 │   ├── kernel_amd64.s      # AVX2+FMA assembly
 │   ├── kernel_other.go     # !amd64 stubs
 │   └── kernel_test.go
-├── cmd/vecbench/           # end-to-end benchmark CLI (linux only)
+├── cmd/vecbench/           # end-to-end benchmark CLI
 │   └── main.go
+├── filter/                 # metadata filters
+│   ├── bitmap.go           # Roaring-style compressed bitmap
+│   ├── columns.go          # column store + filter expressions
+│   └── filter_test.go
 ├── search/                 # batched top-k search + request batcher
 │   ├── search.go
 │   ├── batcher.go
 │   ├── search_test.go
-│   └── live_linux_test.go  # search over a real arena with deleted rows
+│   ├── filter_test.go      # filtered search vs brute force; selectivity benchmark
+│   └── live_test.go        # search over a real arena: deletes, cosine
 └── spsc/                   # single-producer single-consumer ring buffers
     ├── spsc.go
     ├── spsc_test.go
@@ -71,11 +81,19 @@ Stores fixed-dimension float32 vectors in one off-heap memory region with a fixe
 
 ### 4.1 Memory layout
 - `stride = ceil(dim / 16) * 16` floats, so every row is a multiple of 64 bytes (one cache line).
-- One anonymous `mmap` of `stride * maxRows * 4` bytes with
-  `PROT_READ|PROT_WRITE`, `MAP_PRIVATE|MAP_ANON|MAP_NORESERVE`. RAM is committed lazily,
-  page by page, on first write. The base address never moves.
-- Row `id` occupies floats `[id*stride, id*stride + stride)`. The base is page-aligned, so every
-  row is 64-byte aligned.
+- One region of `stride * maxRows * 4` bytes, zero-filled, whose base address never moves.
+  `mapRegion`/`unmapRegion` are the only platform-specific code [DONE, T-04]:
+  - **linux** (`mem_linux.go`): anonymous `mmap` with `PROT_READ|PROT_WRITE`,
+    `MAP_PRIVATE|MAP_ANON|MAP_NORESERVE`. RAM is committed lazily, page by page, on first write.
+    `HugePages` calls `madvise(MADV_HUGEPAGE)`; `Lock` calls `mlock`.
+  - **darwin** (`mem_darwin.go`): the same without `MAP_NORESERVE` (anonymous pages are still
+    committed lazily). `HugePages` is ignored; `Lock` calls `mlock`.
+  - **every other OS** (`mem_other.go`, including windows and the BSDs): a Go `[]byte` of
+    `size + 64` bytes, re-sliced to start on a 64-byte boundary. It holds no pointers, so the GC
+    never scans it, but it does count toward the Go heap and is committed up front. `HugePages`
+    is ignored; `Lock` returns an error. `unmapRegion` is a no-op.
+- Row `id` occupies floats `[id*stride, id*stride + stride)`. The base is 64-byte aligned (page
+  aligned with mmap), so every row is 64-byte aligned.
 - **Invariant P (padding):** floats `[dim, stride)` of every row are always zero. `mmap` zero-fills
   memory and `Add` writes only `dim` floats. Kernels depend on this to scan whole strides.
 - No Go pointers are ever stored in arena memory.
@@ -84,8 +102,9 @@ Stores fixed-dimension float32 vectors in one off-heap memory region with a fixe
 
 ```go
 type Options struct {
-    HugePages bool // madvise(MADV_HUGEPAGE), best effort; errors ignored
-    Lock      bool // mlock the whole region; fails if RLIMIT_MEMLOCK is too low
+    HugePages bool // madvise(MADV_HUGEPAGE) on linux, best effort; errors ignored
+    Lock      bool // mlock the whole region; fails if RLIMIT_MEMLOCK is too low or unsupported
+    Normalize bool // store every added vector scaled to unit L2 norm (cosine similarity)
 }
 type Arena struct { /* unexported */ }
 ```
@@ -101,7 +120,7 @@ their delete epoch, guarded by `wmu`), `epoch` (atomic uint64, written only unde
 | Signature | Semantics |
 |---|---|
 | `New(dim, maxRows int, opt Options) (*Arena, error)` | Errors: `dim <= 0` or `maxRows <= 0`; mmap failure; mlock failure (the region is unmapped before returning). |
-| `(*Arena) Add(v []float32) (uint32, error)` | `len(v) != dim` returns error `"vecarena: wrong dimension"`. Reuses the most recently freed id (LIFO) if one exists: copies `v`, then atomically clears its dead bit. Otherwise takes id `count`, copies `v`, then atomically stores `count+1` (publishing the row). If `count == maxRows` with no free ids, returns error `"vecarena: full"`. Increments `live`. |
+| `(*Arena) Add(v []float32) (uint32, error)` | `len(v) != dim` returns error `"vecarena: wrong dimension"`. Reuses the most recently freed id (LIFO) if one exists: copies `v`, then atomically clears its dead bit. Otherwise takes id `count`, copies `v`, then atomically stores `count+1` (publishing the row). If `count == maxRows` with no free ids, returns error `"vecarena: full"`. Increments `live`. With `Options.Normalize`, the stored row (never the caller's `v`) is scaled to unit length with `kernel.Normalize` before it is published. |
 | `(*Arena) Delete(id uint32)` | No-op if `id >= count` or the row is already dead. Otherwise sets the dead bit atomically, appends `(id, epoch)` to `pending`, decrements `live`, then runs reclamation (4.4). Idempotent. The id becomes reusable only once reclaimed. |
 | `(*Arena) Enter() Guard`, `(Guard) Exit()` | Mark a read section. While a `Guard` is held, no row that was live when it was taken is reused. Every `Enter` must be paired with `Exit`. |
 | `(*Arena) IsLive(id uint32) bool` | `id < count` and the dead bit is clear. Lock-free; usable as `search.Index.Live`. |
@@ -139,6 +158,37 @@ their delete epoch, guarded by `wmu`), `epoch` (atomic uint64, written only unde
   must actually be reused. Fails within 1 s if reclamation ignores epochs.
 - `BenchmarkScan100k768`: scalar scan via `Range` (baseline only).
 
+### 4.6 Collection: external keys [DONE, T-05]
+
+```go
+type Collection[K comparable] struct { /* unexported */ }
+func NewCollection[K comparable](dim, maxRows int, opt Options) (*Collection[K], error)
+```
+
+Maps keys of any comparable type (typically `string` or `uint64`) to row ids of an `Arena` it
+owns. State: `ids map[K]uint32`, `keys []K` (row id to key, the zero `K` for deleted rows), and
+an `RWMutex` held for writing around every arena write.
+
+| Signature | Semantics |
+|---|---|
+| `Upsert(key K, v []float32) (uint32, error)` | Adds `v` as a **new** row, maps `key` to it, then deletes the key's previous row (if any). Never overwrites a row in place, so readers never see a torn row; the id may change. On error (dimension, full) the previous value stays. |
+| `Delete(key K) bool` | Removes the key and deletes its row. Reports whether the key existed. |
+| `ID(key K) (uint32, bool)`, `Key(id uint32) (K, bool)` | Lookups in each direction. `Key` returns false for a row that is not live. Translate search results while holding the search's `Guard`, so no id is reused in between. |
+| `Get(key K) ([]float32, bool)` | View of the key's row. |
+| `Len() int`, `Arena() *Arena`, `Close() error` | `Arena()` is for searching; writing to it directly breaks the mapping. |
+
+Memory, measured by `TestCollectionMemoryPerKey` (1M keys, Go 1.24, linux/amd64), Go heap only
+(vectors are in the arena): **46 bytes per `uint64` key, 90 bytes per 16-byte `string` key**
+(map entry plus the `keys` slot, plus the string's bytes).
+
+Tests:
+- `TestCollectionRoundTrip`: 20k random upserts and deletes over 300 string keys against a
+  reference map; `ID`/`Key`/`Get` round-trip, `Len` matches, and no row leaks (live rows ==
+  keys).
+- `TestCollectionConcurrentReaders`: readers translate every live row to its key under a
+  `Guard` while a writer upserts; the vector always encodes the key it maps to. Must pass `-race`.
+- `TestCollectionMemoryPerKey`: logs the numbers above (skipped with `-short`).
+
 ## 5. Package `kernel` (distance kernels)
 
 ### 5.1 API [DONE]
@@ -150,6 +200,7 @@ their delete epoch, guarded by `wmu`), `epoch` (atomic uint64, written only unde
 | `DotBatch(q, rows []float32, stride int, out []float32)` | `stride > 0`, `stride % 16 == 0`, `len(q) == stride`, `len(rows) >= len(out)*stride` | `out[i] = q · rows[i*stride:(i+1)*stride]`, with `n = len(out)` |
 | `DotBatch8(qs, rows []float32, stride int, out []float32)` | `stride > 0`, `stride % 8 == 0`, `len(out) % 8 == 0`, `len(qs) == 8*stride`, `len(rows) >= (len(out)/8)*stride` | `out[r*8+q] = qs[q*stride:(q+1)*stride] · row_r` (row-major) |
 | `const QueryGroup = 8` | | queries per `DotBatch8` pass |
+| `Normalize(v []float32)` | | scales `v` in place to unit L2 norm (norm computed in float64 from `Dot(v, v)`); a zero vector is unchanged [DONE, T-06] |
 | `Accelerated() bool` | | whether the AVX2 assembly paths are active |
 
 Callers zero-pad queries and rows out to `stride`; Invariant P guarantees this for arena rows.
@@ -185,9 +236,11 @@ Results are compared with a float64 reference, not by exact equality. Tolerance:
 - `TestDotBatch`: strides 16, 32, 48, 784 × 37 rows.
 - `TestDotBatch8`: strides 8, 16, 64, 784 × 29 rows × 8 queries.
 - `TestDetect`: logs `Accelerated()`.
+- `TestNormalize`: lengths 1 to 768 with norms near 1000; result has unit norm and matches
+  `v / |v|` in float64; zero and empty vectors are unchanged.
 - `go vet ./...` must also pass with `GOARCH=arm64`.
 
-## 6. Package `search`
+## 6. Packages `search` and `filter`
 
 ### 6.1 Index [DONE]
 
@@ -200,12 +253,30 @@ type Index struct {
 }
 func New(rows []float32, stride, n int) *Index
 func (ix *Index) SearchBatch(queries [][]float32, k int) [][]Result
+func (ix *Index) SearchFiltered(queries [][]float32, k int, filters []Filter) [][]Result
+
+type Filter interface { // *filter.Bitmap implements it
+    Contains(id uint32) bool
+    Cardinality() int
+    Iterate(fn func(id uint32) bool) // ascending ids, until fn returns false
+}
+const SparseFraction = 0.05
 ```
 
 Preconditions: `stride % 8 == 0`; `len(rows) >= n*stride`; rows are zero-padded; every
-`len(query) <= stride`.
+`len(query) <= stride` (a longer query panics with `"search: query longer than stride"`);
+`filters` is nil or has one entry per query (else panic); any entry may be nil (no filter).
 
-`SearchBatch` algorithm:
+`SearchBatch(q, k)` is `SearchFiltered(q, k, nil)`.
+
+**Planner [DONE, T-07]:** a query whose filter has `Cardinality() < SparseFraction * n` takes the
+**sparse path**: it iterates the filter's ids, stops at the first id `>= n`, and scores each row
+with `kernel.Dot(q, row[:len(q)])` into its own top-k heap (checking `Live` too). Sparse queries
+are spread across `Workers` goroutines, one query at a time. Every other query (unfiltered, or
+filter at or above the threshold) takes the **dense path** below, and its filter is checked at
+heap push. Dense and sparse groups run one after the other.
+
+Dense path algorithm:
 1. If `len(queries) == 0` or `k <= 0`, return `make([][]Result, len(queries))`.
 2. **Pack** the queries into groups of 8, each `stride` floats, contiguous and zero-padded. Unused
    slots in the last group stay zero.
@@ -215,11 +286,13 @@ Preconditions: `stride % 8 == 0`; `len(rows) >= n*stride`; rows are zero-padded;
    to the next tile, so the tile is read from RAM once and then re-read from L2.
 5. Each worker keeps one top-k min-heap per query. When the heap is full, a score `<=` the root is
    rejected with a single comparison. Only a score that would enter the heap is checked against
-   `Live` (if set), so the filter costs nothing for most rows.
+   `Live` and the query's filter, combined into one per-query predicate (nil when neither
+   applies) so the hot loop has a single call site; a second call site measurably slowed batch 8.
+   Filters therefore cost nothing for most rows.
 6. Merge the per-worker heaps into a final top-k per query, sorted by descending score.
    Order among equal scores is unspecified.
 
-Output: per query, `min(k, live rows)` results.
+Output: per query, `min(k, rows that are live and pass its filter)` results.
 
 **Tombstones [DONE]:** to search an arena with deletes, set `Live = arena.IsLive` and hold an
 arena `Guard` around `SearchBatch` so no row is reused mid-scan.
@@ -248,7 +321,43 @@ var ErrClosed = errors.New("search: batcher closed")
     and every request it drains afterwards, get `ErrClosed`. It exits when the request channel is
     closed. A batch already running when `Close` is called completes normally.
 
-### 6.3 Tests [DONE]
+### 6.3 Package `filter` [DONE, T-07]
+
+**Bitmap.** A Roaring-style set of `uint32` ids. The id space is split into chunks of 65536 by
+the high 16 bits; `keys []uint16` (sorted) and `conts []*container` hold one container per
+non-empty chunk. A container is either a sorted `[]uint16` array (cardinality `<= 4096`, 2 bytes
+per id) or a 1024-word bitset (8 KiB). **Invariant R:** a container is a bitset exactly when its
+cardinality exceeds 4096, and no container is empty. Every operation restores R.
+
+| Signature | Semantics |
+|---|---|
+| `Of(ids ...uint32) *Bitmap`, `All(n uint32) *Bitmap` | Constructors. `All(n)` holds `[0, n)`. The zero `Bitmap` is empty. |
+| `Add`, `Remove`, `Contains` | Single ids. Appending in ascending order is O(1) per id. |
+| `Cardinality() int`, `Iterate(fn)`, `ToSlice()`, `Clone()` | Iteration is ascending and stops when `fn` returns false. |
+| `Intersect(a, b)`, `Union(a, b)`, `Difference(a, b)` | Return a new bitmap; inputs are untouched. Work container by container: array/array by merge or filter, bitset/bitset by word ops, mixed by membership tests. |
+
+Concurrent reads are safe; mutation is not.
+
+**Columns.** A column store of per-row metadata, safe for concurrent use (`RWMutex`).
+- String columns are dictionary encoded: value to code (`dict`), code to value (`vals`), row to
+  code (`codes`, 0 = unset), and a `Bitmap` of rows per code. `SetString` moves the row between
+  code bitmaps.
+- Number columns store `[]float64` plus a `Bitmap` of rows that have a value.
+- `n` is 1 + the highest row id ever set: the universe for `Not`.
+
+| Signature | Semantics |
+|---|---|
+| `NewColumns()`, `SetString(id, col, val)`, `SetNumber(id, col, v)` | Set or replace a value. |
+| `String(id, col)`, `Number(id, col)` | Read a value. |
+| `Clear(id)` | Removes every value of the row; call it when the row is deleted. |
+| `Select(e Expr) *Bitmap` | Evaluates `e` into a new bitmap that later writes do not change. |
+
+Expressions: `Eq(col, val)`, `In(col, vals...)` (bitmap lookups); `Range(col, lo, hi)` inclusive,
+`AtLeast`, `AtMost` (scan the column); `Has(col)`; `And(...)` (short-circuits on empty; `And()` is
+`All(n)`); `Or(...)` (`Or()` is empty); `Not(e)` is `Difference(All(n), e)`, so it includes rows
+with no value in `e`'s columns. A missing column or value matches nothing.
+
+### 6.4 Tests [DONE]
 - `TestSearchBatchMatchesBruteForce`: n = 5000, dim 100, stride 112, TileRows = 333 (uneven
   tiles), k = 10, query counts 1, 7, 8, 9, 20. Result ids must match an exact float64 top-k in order.
 - `TestBatcherGroupsConcurrentRequests`: 40 concurrent `Search` calls, maxBatch 16, maxWait 5 ms;
@@ -256,9 +365,19 @@ var ErrClosed = errors.New("search: batcher closed")
 - `TestBatcherCloseRace`: 1000 concurrent `Search` calls race `Close`; every call returns (a
   result or `ErrClosed`) within 1 s; a second `Close` doesn't panic; `Search` after `Close`
   returns `ErrClosed`.
-- `TestDeletedRowsNeverReturned` (linux): delete the 100 best matches for a query from an arena;
+- `TestDeletedRowsNeverReturned`: delete the 100 best matches for a query from an arena;
   with `Live = arena.IsLive`, none is returned and results equal brute force over the live rows.
+- `TestCosineTopK`: an arena with `Normalize` holding vectors whose norms vary by 10^4; with a
+  normalised query, ids and scores match float64 cosine similarity (T-06 acceptance).
+- `TestSearchFilteredMatchesBruteForce`: one batch mixing filters at 1%, 4% (sparse path), 10%,
+  50%, 100% (dense path), no filter, a 3-id filter, an empty filter, and ids `>= n`; with and
+  without `Live`. Results equal filtered brute force in order (T-07 acceptance).
+- `TestBitmapAgainstMap`, `TestAll`, `TestIterateStops`: bitmap operations against a map
+  reference, with chunks on both sides of the 4096 threshold; Invariant R checked throughout.
+- `TestColumnsSelect`: every expression form, after overwrites and `Clear`, against row-wise
+  evaluation.
 - `BenchmarkThroughput`: 100k × 768, k = 10, batch sizes 1, 8, 32, 64; reports `queries/s` and `ms/batch`.
+- `BenchmarkFiltered`: 100k × 768, k = 10, batches of 8, random filters at 1%, 10%, 50% and none.
 
 ## 7. Package `spsc`
 
@@ -325,6 +444,11 @@ machine, report the median of at least 5 runs, and compare relative changes.
 | `search.SearchBatch`, 100k × 768, k = 10 | batch 1: 43 q/s · batch 8: 322 q/s · batch 32: 509 q/s · batch 64: 562 q/s |
 | `spsc`, ns per item (median of 7, yield when blocked) | Channel 62.1 · Mutex 65.7 · Naive 150.6 · Padded 200.6 · Cached 111.4 · Cached, batches of 64: 4.66 · Channel of 64-item arrays: 1.69 |
 
+Filtered search (`BenchmarkFiltered`, measured on a 6-core Intel i7-9750H laptop, 12 threads,
+median of 5): 1% selectivity 9,425 q/s (sparse path); 10% 624 q/s; 50% 625 q/s; no filter
+643 q/s. The dense path costs the same with or without a filter. A sparse scan at 5% does about
+1/20 of the work of a full scan, so the 5% threshold is conservative; tuning it is open.
+
 How to read the SPSC numbers: sending one item at a time, the lock-free rings did not beat
 channels on this VM, most likely because the queue sat near empty. Batching dominates. Before
 optimising SPSC further, re-benchmark on dedicated cores with threads pinned (backlog `T-12`).
@@ -339,10 +463,10 @@ whole test suite (section 10).
 | T-01 | P0 [DONE] | Fix B-01 (torn read on slot reuse). Hold freed ids in a *pending* list and move them to `free` only after every reader active at delete time has finished. Use epoch-based reclamation: readers enter and exit an epoch around `Range`/`Block` scans. | New test: readers verify a per-row checksum while a writer deletes and re-adds rows in a loop. Zero mismatches in 10 s under `-race`. |
 | T-02 | P0 [DONE] | Tombstones in search. `search.New` accepts an optional `Live func(id uint32) bool`, or a bitset view exported by `Arena`. Dead rows never appear in results. | Test: delete the 100 best matches for a query; none of them are returned. |
 | T-03 | P0 [DONE] | Fix B-02/B-03 in `Batcher`: `Close` is idempotent (`sync.Once`); after `Close`, pending and in-flight enqueues get `ErrClosed`. The dispatcher drains the channel on shutdown and replies `ErrClosed` to each request. | Test: 1000 concurrent `Search` calls racing `Close`; every call returns (a result or `ErrClosed`) within 1 s; calling `Close` twice doesn't panic. |
-| T-04 | P1 | Non-Linux build: `arena_other.go` using `syscall.Mmap` without `MAP_NORESERVE` on darwin; the huge-page option is a no-op there. | `GOOS=darwin go vet ./...` passes. |
-| T-05 | P1 | External ids: map `string` or `uint64` ids to internal `uint32` ids and back; handle upsert and delete. | Round-trip test; memory use per id documented. |
-| T-06 | P1 | `kernel.Normalize(v []float32)` (in place, L2), and an `Options.Normalize` flag on insert for cosine similarity. | Cosine top-k matches a float64 reference. |
-| T-07 | P1 | Metadata filters: a column store plus Roaring-style bitmaps. `SearchBatch` takes a per-query filter. Planner: if a filter matches < 5% of rows, brute-force only those rows; otherwise filter at heap push. | Results equal filtered brute force; benchmark at 1%, 10% and 50% selectivity. |
+| T-04 | P1 [DONE] | Non-Linux build: `arena_other.go` using `syscall.Mmap` without `MAP_NORESERVE` on darwin; the huge-page option is a no-op there. | `GOOS=darwin go vet ./...` passes. |
+| T-05 | P1 [DONE] | External ids: map `string` or `uint64` ids to internal `uint32` ids and back; handle upsert and delete. | Round-trip test; memory use per id documented. |
+| T-06 | P1 [DONE] | `kernel.Normalize(v []float32)` (in place, L2), and an `Options.Normalize` flag on insert for cosine similarity. | Cosine top-k matches a float64 reference. |
+| T-07 | P1 [DONE] | Metadata filters: a column store plus Roaring-style bitmaps. `SearchBatch` takes a per-query filter. Planner: if a filter matches < 5% of rows, brute-force only those rows; otherwise filter at heap push. | Results equal filtered brute force; benchmark at 1%, 10% and 50% selectivity. |
 | T-08 | P2 | int8 quantised scan with rerank: store int8 codes plus scale; AVX2 (`VPMADDUBSW`/`VPMADDWD`) and VNNI (`VPDPBUSD`) kernels, dispatched by CPUID; take the top `k*4` by int8 score, rerank with float32. | recall@10 >= 0.99 against exact search on random and normalised data; scan faster than float32 on the 100k × 768 benchmark. |
 | T-09 | P2 | AVX-512 `DotBatch16` (16 queries per pass) with CPUID/XCR0 detection (bits 5–7 for the ZMM state). | Same tests as `DotBatch8`; throughput benchmark at batch 16 and 64. |
 | T-10 | P2 | Snapshots: a file-backed `mmap` arena plus an append-only log; recover on start. | Kill-and-restart test: every acknowledged insert survives. |
@@ -359,6 +483,8 @@ Run from the repository root; all must pass:
 gofmt -l .                      # prints nothing
 go vet ./...
 GOARCH=arm64 go vet ./...       # fallbacks still compile
+GOOS=darwin go vet ./...        # mem_darwin.go
+GOOS=windows go vet ./...       # mem_other.go
 go test -race -count=1 ./...
 ```
 
@@ -378,4 +504,4 @@ go test -run x -bench . -count 5 ./kernel ./search ./spsc
   and a `!amd64` stub. It is tested against a float64 reference at lengths that hit every loop tail.
 - **Comments:** each package opens with a doc comment explaining the design. Each non-obvious
   ordering (publish after write, clear before release) has a one-line comment saying why.
-- **Unsafe:** only in `vecarena` (mmap views). No Go pointers are ever written into mmap'd memory.
+- **Unsafe:** only in `vecarena` (mmap views and the heap fallback's alignment). No Go pointers are ever written into mmap'd memory.

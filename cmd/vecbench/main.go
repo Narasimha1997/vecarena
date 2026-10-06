@@ -1,5 +1,3 @@
-//go:build linux
-
 // Command vecbench is an end-to-end benchmark for vecarena. It fills an arena
 // with random vectors, then measures, in order:
 //

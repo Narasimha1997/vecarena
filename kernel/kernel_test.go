@@ -81,6 +81,35 @@ func TestDotBatch(t *testing.T) {
 	}
 }
 
+func TestNormalize(t *testing.T) {
+	r := rand.New(rand.NewSource(4))
+	for _, n := range []int{1, 3, 16, 100, 768} {
+		v := randVec(r, n)
+		for i := range v {
+			v[i] *= 1000 // norms far from 1
+		}
+		want := math.Sqrt(dot64(v, v))
+		orig := append([]float32(nil), v...)
+		Normalize(v)
+		if got := dot64(v, v); math.Abs(got-1) > 1e-5 {
+			t.Fatalf("n=%d: |v|^2 = %v after Normalize", n, got)
+		}
+		for i := range v {
+			if d := math.Abs(float64(v[i]) - float64(orig[i])/want); d > 1e-6 {
+				t.Fatalf("n=%d i=%d: got %v want %v", n, i, v[i], float64(orig[i])/want)
+			}
+		}
+	}
+	z := make([]float32, 8)
+	Normalize(z)
+	for _, x := range z {
+		if x != 0 {
+			t.Fatal("zero vector changed")
+		}
+	}
+	Normalize(nil)
+}
+
 var sink float32
 
 func benchPair(b *testing.B, f func(a, b []float32) float32, n int) {

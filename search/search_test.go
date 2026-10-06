@@ -37,7 +37,7 @@ func bruteTopK(rows []float32, stride, n int, q []float32, k int, live func(uint
 		all = append(all, pair{uint32(i), s})
 	}
 	sort.Slice(all, func(a, b int) bool { return all[a].s > all[b].s })
-	ids := make([]uint32, k)
+	ids := make([]uint32, min(k, len(all)))
 	for i := range ids {
 		ids[i] = all[i].id
 	}

@@ -1,5 +1,3 @@
-//go:build linux
-
 package vecarena
 
 import (
@@ -7,18 +5,20 @@ import (
 	"math/bits"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"unsafe"
+
+	"vecarena/kernel"
 )
 
 const cacheLine = 64
 
 type Arena struct {
-	dim     int
-	stride  int
-	maxRows int
-	mem     []byte
-	data    []float32
+	dim       int
+	stride    int
+	maxRows   int
+	normalize bool
+	mem       []byte
+	data      []float32
 
 	count atomic.Int64
 	live  atomic.Int64
@@ -54,8 +54,9 @@ type Guard struct {
 }
 
 type Options struct {
-	HugePages bool
-	Lock      bool
+	HugePages bool // madvise(MADV_HUGEPAGE) on Linux; ignored elsewhere
+	Lock      bool // mlock the whole region; fails if the platform cannot
+	Normalize bool // store every added vector scaled to unit length (cosine similarity)
 }
 
 func New(dim, maxRows int, opt Options) (*Arena, error) {
@@ -66,23 +67,12 @@ func New(dim, maxRows int, opt Options) (*Arena, error) {
 	stride := (dim + per - 1) / per * per
 	size := stride * maxRows * 4
 
-	mem, err := syscall.Mmap(-1, 0, size,
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_PRIVATE|syscall.MAP_ANON|syscall.MAP_NORESERVE)
+	mem, err := mapRegion(size, opt)
 	if err != nil {
 		return nil, err
 	}
-	if opt.HugePages {
-		_ = syscall.Madvise(mem, 14)
-	}
-	if opt.Lock {
-		if err := syscall.Mlock(mem); err != nil {
-			syscall.Munmap(mem)
-			return nil, err
-		}
-	}
 	a := &Arena{
-		dim: dim, stride: stride, maxRows: maxRows, mem: mem,
+		dim: dim, stride: stride, maxRows: maxRows, mem: mem, normalize: opt.Normalize,
 		data: unsafe.Slice((*float32)(unsafe.Pointer(&mem[0])), stride*maxRows),
 		dead: make([]uint64, (maxRows+63)/64),
 	}
@@ -103,7 +93,7 @@ func (a *Arena) Add(v []float32) (uint32, error) {
 	if n := len(a.free); n > 0 {
 		id = a.free[n-1]
 		a.free = a.free[:n-1]
-		copy(a.row(id), v)
+		a.write(id, v)
 		atomic.AndUint64(&a.dead[id/64], ^(1 << (id % 64)))
 	} else {
 		c := a.count.Load()
@@ -111,11 +101,21 @@ func (a *Arena) Add(v []float32) (uint32, error) {
 			return 0, errors.New("vecarena: full")
 		}
 		id = uint32(c)
-		copy(a.row(id), v)
+		a.write(id, v)
 		a.count.Store(c + 1)
 	}
 	a.live.Add(1)
 	return id, nil
+}
+
+// write fills row id from v before the row is published. The row is
+// normalized in place, so the caller's slice is never modified.
+func (a *Arena) write(id uint32, v []float32) {
+	row := a.row(id)[:a.dim]
+	copy(row, v)
+	if a.normalize {
+		kernel.Normalize(row)
+	}
 }
 
 func (a *Arena) Delete(id uint32) {
@@ -221,5 +221,5 @@ func (a *Arena) Range(lo, hi int, fn func(id uint32, v []float32)) {
 
 func (a *Arena) Close() error {
 	a.data = nil
-	return syscall.Munmap(a.mem)
+	return unmapRegion(a.mem)
 }

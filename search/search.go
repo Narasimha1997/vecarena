@@ -4,6 +4,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"vecarena/kernel"
 )
@@ -37,16 +38,75 @@ func New(rows []float32, stride, n int) *Index {
 	return &Index{rows: rows, stride: stride, n: n, TileRows: tile, Workers: runtime.GOMAXPROCS(0)}
 }
 
+// Filter restricts one query to a subset of row ids. *filter.Bitmap
+// implements it.
+type Filter interface {
+	Contains(id uint32) bool
+	Cardinality() int
+	Iterate(fn func(id uint32) bool) // ascending ids, until fn returns false
+}
+
+// SparseFraction is the planner threshold. A query whose filter matches fewer
+// than this fraction of the index's rows scores only those rows, one by one.
+// Any other query joins the tiled batch scan and is filtered at heap push.
+const SparseFraction = 0.05
+
+// SearchBatch returns the top k rows for each query, by descending dot
+// product. It is SearchFiltered with no filters.
 func (ix *Index) SearchBatch(queries [][]float32, k int) [][]Result {
+	return ix.SearchFiltered(queries, k, nil)
+}
+
+// SearchFiltered is SearchBatch with an optional filter per query: only rows
+// in filters[i] can appear in results[i]. filters may be nil, and any entry
+// may be nil (no filter); otherwise len(filters) must equal len(queries).
+func (ix *Index) SearchFiltered(queries [][]float32, k int, filters []Filter) [][]Result {
 	nq := len(queries)
+	results := make([][]Result, nq)
 	if nq == 0 || k <= 0 {
-		return make([][]Result, nq)
+		return results
+	}
+	if filters != nil && len(filters) != nq {
+		panic("search: len(filters) != len(queries)")
 	}
 
+	var dense, sparse []int
+	for i, q := range queries {
+		if len(q) > ix.stride {
+			panic("search: query longer than stride")
+		}
+		if filters != nil && filters[i] != nil &&
+			float64(filters[i].Cardinality()) < SparseFraction*float64(ix.n) {
+			sparse = append(sparse, i)
+		} else {
+			dense = append(dense, i)
+		}
+	}
+	if len(dense) > 0 {
+		ix.scanDense(queries, filters, dense, k, results)
+	}
+	if len(sparse) > 0 {
+		ix.scanSparse(queries, filters, sparse, k, results)
+	}
+	return results
+}
+
+// scanDense runs queries[idx] through the tiled DotBatch8 scan over every row
+// and stores each result at results[idx[j]].
+func (ix *Index) scanDense(queries [][]float32, filters []Filter, idx []int, k int, results [][]Result) {
+	nq := len(idx)
 	groups := (nq + kernel.QueryGroup - 1) / kernel.QueryGroup
 	packed := make([]float32, groups*kernel.QueryGroup*ix.stride)
-	for i, q := range queries {
-		copy(packed[i*ix.stride:], q)
+	// keep[j] combines Live and query j's filter into one predicate (nil if
+	// neither applies), so the hot loop has a single call site.
+	keep := make([]func(uint32) bool, nq)
+	for j, i := range idx {
+		copy(packed[j*ix.stride:], queries[i])
+		var f Filter
+		if filters != nil {
+			f = filters[i]
+		}
+		keep[j] = keepFunc(ix.Live, f)
 	}
 
 	workers := ix.Workers
@@ -58,7 +118,6 @@ func (ix *Index) SearchBatch(queries [][]float32, k int) [][]Result {
 		workers = tiles
 	}
 
-	isLive := ix.Live
 	partial := make([][]topK, workers)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -83,13 +142,17 @@ func (ix *Index) SearchBatch(queries [][]float32, k int) [][]Result {
 					kernel.DotBatch8(qs, tile, ix.stride, out)
 
 					base := g * kernel.QueryGroup
-					live := min(kernel.QueryGroup, nq-base)
+					active := min(kernel.QueryGroup, nq-base)
 					for r := 0; r < hi-lo; r++ {
-						row := out[r*kernel.QueryGroup : r*kernel.QueryGroup+live]
+						row := out[r*kernel.QueryGroup : r*kernel.QueryGroup+active]
 						id := uint32(lo + r)
 						for q, s := range row {
 							h := &heaps[base+q]
-							if !h.accepts(s) || (isLive != nil && !isLive(id)) {
+							// Cheapest check first: most scores miss the heap.
+							if !h.accepts(s) {
+								continue
+							}
+							if kf := keep[base+q]; kf != nil && !kf(id) {
 								continue
 							}
 							h.push(id, s)
@@ -102,17 +165,62 @@ func (ix *Index) SearchBatch(queries [][]float32, k int) [][]Result {
 	}
 	wg.Wait()
 
-	results := make([][]Result, nq)
-	for q := 0; q < nq; q++ {
+	for j, i := range idx {
 		final := newTopK(k)
 		for w := 0; w < workers; w++ {
-			for _, r := range partial[w][q].items {
+			for _, r := range partial[w][j].items {
 				final.push(r.ID, r.Score)
 			}
 		}
-		results[q] = final.sorted()
+		results[i] = final.sorted()
 	}
-	return results
+}
+
+// keepFunc returns a predicate for rows that are live and pass f, or nil if
+// every row passes.
+func keepFunc(live func(uint32) bool, f Filter) func(uint32) bool {
+	switch {
+	case f == nil:
+		return live
+	case live == nil:
+		return f.Contains
+	}
+	return func(id uint32) bool { return f.Contains(id) && live(id) }
+}
+
+// scanSparse scores each query in queries[idx] against only the rows its
+// filter matches. Queries are spread across workers, one query at a time.
+func (ix *Index) scanSparse(queries [][]float32, filters []Filter, idx []int, k int, results [][]Result) {
+	isLive := ix.Live
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for w := 0; w < max(1, min(ix.Workers, len(idx))); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				j := int(next.Add(1)) - 1
+				if j >= len(idx) {
+					return
+				}
+				q := queries[idx[j]]
+				h := newTopK(k)
+				filters[idx[j]].Iterate(func(id uint32) bool {
+					if int(id) >= ix.n {
+						return false // ids ascend, so the rest are out of range too
+					}
+					off := int(id) * ix.stride
+					s := kernel.Dot(q, ix.rows[off:off+len(q)])
+					if h.accepts(s) && (isLive == nil || isLive(id)) {
+						h.push(id, s)
+					}
+					return true
+				})
+				results[idx[j]] = h.sorted()
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 type topK struct {
